@@ -1,20 +1,37 @@
-//! `jero-arch-mistral`: Mistral and Mixtral architecture recipe for the `SpacemiT` K3 platform.
+//! `jero-arch-mistral`: Mistral, `Mistral3`, and Mixtral architecture recipe for the `SpacemiT` K3 platform.
 //!
-//! Implements [`jero_core::ArchRecipe`] for Mistral and Mixtral models (`mistral`, `mixtral`),
-//! supporting Sliding Window Attention (SWA), top-2 of 8 Sparse Mixture-of-Experts (`MoE`) routing,
+//! Implements [`jero_core::ArchRecipe`] for `Mistral`, `Mistral3` (`12B`/`24B`), and `Mixtral`
+//! models (`"mistral"`, `"mistral3"`, `"mixtral"`), supporting Sliding Window Attention (`SWA`),
+//! `128-byte`-aligned `RepackedWeight` dense layer caching, zero-copy `3D` `_exps` expert
+//! slicing, Tekken (`131,072`) / `SentencePiece` (`32,000`/`32,768`) vocab contract validation,
 //! and 28 GiB `RLIMIT_MEMLOCK` admission policy enforcement per ADR-023, ADR-024, and ADR-037.
 
 pub mod admission;
 mod kernels_compat;
 pub mod recipe;
+pub mod repack_cache;
 
 #[cfg(test)]
 mod forward_tests;
 
 pub use admission::{
-    COMPACT_MOE_ADVISORY, DEFAULT_MEMLOCK_LIMIT_BYTES, evaluate_moe_memlock_admission,
+    COMPACT_MOE_ADVISORY, DEFAULT_MEMLOCK_LIMIT_BYTES, DEFAULT_MISTRAL_SCRATCH_BYTES,
+    MISTRAL_7B_KV_BYTES_PER_TOKEN, MISTRAL3_KV_BYTES_PER_TOKEN, MIXTRAL_KV_BYTES_PER_TOKEN,
+    MemlockBudgetReport, MistralModelProfile, MistralTokenizerFamily, MistralVocabContract,
+    SENTENCEPIECE_VOCAB_32K, SENTENCEPIECE_VOCAB_32K_EXT, TEKKEN_VOCAB_SIZE,
+    classify_mistral_manifest_profile, classify_mistral_vocab_family,
+    estimate_mistral_scratch_bytes, evaluate_moe_memlock_admission, format_mistral_inst_prompt,
+    validate_gguf_tokenizer_and_lm_head, validate_vocab_stop_contract,
+    verify_mistral_admission_with_scratch, verify_mistral_recipe_admission,
+    verify_mixtral_admission,
 };
 pub use recipe::{MistralRecipe, RopeScalingConfig, route_top2_experts, route_topk_experts};
+pub use repack_cache::{
+    CachedDenseProjection, CachedProjectionLookup, DEFAULT_DENSE_F32_MAX_ELEMENTS,
+    DEFAULT_MAX_REPACKED_CACHE_BYTES, ExpertSliceMeta, MistralActScratch, MistralCacheStats,
+    MistralLayerCache, TensorIdentity, WEIGHT_CACHE_ALIGNMENT_BYTES, clear_global_layer_cache,
+    inspect_packed_expert_slice, slice_packed_expert,
+};
 
 #[cfg(test)]
 mod tests {

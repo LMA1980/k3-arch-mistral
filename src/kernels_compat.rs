@@ -371,7 +371,7 @@ fn matvec_f32_rows(
 }
 
 #[inline]
-fn dot_f32_compat(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot_f32_compat(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "with-kernels")]
     {
         BaselineKernel::new().dot_product_f32(a, b)
@@ -417,7 +417,7 @@ pub(crate) fn tensor_bounds_err(tensor: &TensorView<'_>, offset: usize, reason: 
 }
 
 #[cfg(not(feature = "with-kernels"))]
-fn f16_to_f32_portable(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32_portable(bits: u16) -> f32 {
     let sign = u32::from((bits >> 15) & 0x0001);
     let exp = u32::from((bits >> 10) & 0x001F);
     let mant = u32::from(bits & 0x03FF);
@@ -441,7 +441,7 @@ fn f16_to_f32_portable(bits: u16) -> f32 {
 }
 
 #[cfg(not(feature = "with-kernels"))]
-fn bf16_to_f32_portable(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32_portable(bits: u16) -> f32 {
     let exp = (bits >> 7) & 0x00FF;
     let sign = (bits >> 15) & 0x0001;
     if exp == 0x00FF {
@@ -593,7 +593,7 @@ fn matvec_portable(
 }
 
 #[cfg(not(feature = "with-kernels"))]
-fn decode_quant_row_portable(quant: QuantType, row_slice: &[u8], out: &mut [f32]) {
+pub(crate) fn decode_quant_row_portable(quant: QuantType, row_slice: &[u8], out: &mut [f32]) {
     let block_elems = quant.block_elements();
     let block_bytes = quant.block_bytes();
     for (blk_idx, chunk) in out.chunks_exact_mut(block_elems).enumerate() {
