@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use jero_core::TensorShape;
 use jero_core::{K3Error, ModelWeights, QuantType, TensorView};
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight};
+use jero_kernels_rvv::{QuantizedActQ8, RepackedWeight, gemm_repacked_rows};
 
 #[cfg(not(feature = "with-kernels"))]
 use crate::kernels_compat::{
     bf16_to_f32_portable, decode_quant_row_portable, dot_f32_compat, f16_to_f32_portable,
 };
 use crate::kernels_compat::{
-    decode_norm_weights, matvec_tensor, resolve_2d_dims, tensor_bounds_err,
+    decode_norm_weights, matmul_tensor, resolve_2d_dims, tensor_bounds_err,
 };
 
 /// Required payload alignment (`128` bytes) matching `X100` `RVV` / `A100` `IME` tiles.
@@ -140,13 +140,18 @@ pub struct ExpertSliceMeta {
     pub quant: QuantType,
 }
 
-/// Reusable single-token activation buffer (`Q8` tiles under `with-kernels`, `f32` fallback otherwise).
+/// Reusable activation buffer (`Q8` tiles under `with-kernels`, `f32` fallback otherwise)
+/// supporting both single-token (`M = 1`) and batched multi-token (`M > 1`) rows.
 #[derive(Debug, Default)]
 pub struct MistralActScratch {
     #[cfg(feature = "with-kernels")]
     q8: QuantizedActQ8,
     #[cfg(not(feature = "with-kernels"))]
     f32_buf: Vec<f32>,
+    #[cfg(not(feature = "with-kernels"))]
+    m: usize,
+    #[cfg(not(feature = "with-kernels"))]
+    cols: usize,
 }
 
 impl MistralActScratch {
@@ -156,29 +161,76 @@ impl MistralActScratch {
         Self::default()
     }
 
+    /// Number of token rows `M` currently staged in this scratch buffer.
+    #[must_use]
+    pub fn batch_m(&self) -> usize {
+        #[cfg(feature = "with-kernels")]
+        {
+            self.q8.m()
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            self.m
+        }
+    }
+
+    /// Column width `K` currently staged per row in this scratch buffer.
+    #[must_use]
+    pub fn batch_cols(&self) -> usize {
+        #[cfg(feature = "with-kernels")]
+        {
+            self.q8.k()
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            self.cols
+        }
+    }
+
     /// Encodes a single `f32` activation row (`[1, cols]`) into this scratch buffer.
     ///
     /// # Errors
     ///
     /// Returns [`K3Error::TensorBoundsError`] if `act` is empty.
     pub fn prepare_row(&mut self, act: &[f32]) -> Result<(), K3Error> {
-        if act.is_empty() {
+        self.prepare_batch(act, 1, act.len())
+    }
+
+    /// Encodes a row-major `f32` activation batch (`[m, cols]`) into this scratch buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `m == 0`, `cols == 0`, or `act.len() != m * cols`.
+    pub fn prepare_batch(&mut self, act: &[f32], m: usize, cols: usize) -> Result<(), K3Error> {
+        let expected = m
+            .checked_mul(cols)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "MistralActScratch".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(act),
+                buffer_len: usize::MAX,
+                reason: "m * cols overflow in activation batch".to_owned(),
+            })?;
+        if m == 0 || cols == 0 || act.len() != expected {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: "MistralActScratch".to_owned(),
                 offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "activation vector must not be empty".to_owned(),
+                byte_len: size_of_val(act),
+                buffer_len: expected.saturating_mul(size_of::<f32>()),
+                reason: format!("activation length {} != m ({m}) * cols ({cols})", act.len()),
             });
         }
         #[cfg(feature = "with-kernels")]
         {
-            self.q8.quantize_into(act, 1, act.len())
+            self.q8.quantize_into(act, m, cols)
         }
         #[cfg(not(feature = "with-kernels"))]
         {
             self.f32_buf.clear();
-            self.f32_buf.extend_from_slice(act);
+            self.f32_buf
+                .extend(act.iter().map(|&v| if v.is_finite() { v } else { 0.0_f32 }));
+            self.m = m;
+            self.cols = cols;
             Ok(())
         }
     }
@@ -272,86 +324,123 @@ impl PortableAlignedMatrix {
         self.blocks.as_ptr().cast::<u8>()
     }
 
-    fn gemv_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
-        if out.len() != self.rows || input.len() != self.cols {
+    fn decode_row_into(
+        &self,
+        row: usize,
+        row_raw: &mut [u8],
+        row_f32: &mut [f32],
+    ) -> Result<(), K3Error> {
+        let row_blocks = &self.blocks[row * self.blocks_per_row..(row + 1) * self.blocks_per_row];
+        let mut copied = 0_usize;
+        for blk in row_blocks {
+            let take = (self.row_bytes - copied).min(WEIGHT_CACHE_ALIGNMENT_BYTES);
+            if take == 0 {
+                break;
+            }
+            row_raw[copied..copied + take].copy_from_slice(&blk.0[..take]);
+            copied += take;
+        }
+        match self.quant {
+            QuantType::F32 => {
+                for (i, slot) in row_f32.iter_mut().enumerate() {
+                    let off = i * 4;
+                    *slot = f32::from_le_bytes([
+                        row_raw[off],
+                        row_raw[off + 1],
+                        row_raw[off + 2],
+                        row_raw[off + 3],
+                    ]);
+                }
+            }
+            QuantType::F16 => {
+                for (i, slot) in row_f32.iter_mut().enumerate() {
+                    let off = i * 2;
+                    *slot =
+                        f16_to_f32_portable(u16::from_le_bytes([row_raw[off], row_raw[off + 1]]));
+                }
+            }
+            QuantType::BF16 => {
+                for (i, slot) in row_f32.iter_mut().enumerate() {
+                    let off = i * 2;
+                    *slot =
+                        bf16_to_f32_portable(u16::from_le_bytes([row_raw[off], row_raw[off + 1]]));
+                }
+            }
+            QuantType::Q4_0
+            | QuantType::Q8_0
+            | QuantType::Q4_K_M
+            | QuantType::Q5_K
+            | QuantType::Q6_K => {
+                decode_quant_row_portable(self.quant, row_raw, row_f32);
+            }
+            other => {
+                let _ = TensorShape::Inline([0; 8], 0);
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "mistral".to_owned(),
+                    reason: format!(
+                        "unsupported cached dense projection quant {}",
+                        other.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn gemm_rows_f32(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        m: usize,
+        row_range: core::ops::Range<usize>,
+    ) -> Result<(), K3Error> {
+        let expected_in = m.saturating_mul(self.cols);
+        if m == 0 || row_range.start > row_range.end || row_range.end > self.rows {
             return Err(K3Error::TensorBoundsError {
-                tensor_name: "CachedDenseProjection::gemv".to_owned(),
-                offset: 0,
+                tensor_name: "CachedDenseProjection::gemm".to_owned(),
+                offset: row_range.start,
                 byte_len: size_of_val(out),
                 buffer_len: self.rows * size_of::<f32>(),
                 reason: format!(
-                    "GEMV shape mismatch: out={}, input={}, expected rows={}, cols={}",
+                    "invalid GEMM parameters: m={m}, row_range={row_range:?}, rows={}",
+                    self.rows
+                ),
+            });
+        }
+        let sub_n = row_range.len();
+        let expected_out = m.saturating_mul(sub_n);
+        if input.len() != expected_in || out.len() != expected_out {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "CachedDenseProjection::gemm".to_owned(),
+                offset: 0,
+                byte_len: size_of_val(out),
+                buffer_len: expected_out.saturating_mul(size_of::<f32>()),
+                reason: format!(
+                    "GEMM shape mismatch: out={}, input={}, expected m={m}, sub_rows={sub_n}, cols={}",
                     out.len(),
                     input.len(),
-                    self.rows,
                     self.cols
                 ),
             });
         }
+        if sub_n == 0 {
+            return Ok(());
+        }
         let mut row_raw = vec![0_u8; self.row_bytes];
         let mut row_f32 = vec![0.0_f32; self.cols];
-        for (r, dst) in out.iter_mut().enumerate() {
-            let row_blocks = &self.blocks[r * self.blocks_per_row..(r + 1) * self.blocks_per_row];
-            let mut copied = 0_usize;
-            for blk in row_blocks {
-                let take = (self.row_bytes - copied).min(WEIGHT_CACHE_ALIGNMENT_BYTES);
-                if take == 0 {
-                    break;
-                }
-                row_raw[copied..copied + take].copy_from_slice(&blk.0[..take]);
-                copied += take;
+        for r in row_range.clone() {
+            self.decode_row_into(r, &mut row_raw, &mut row_f32)?;
+            let local_n = r - row_range.start;
+            for t in 0..m {
+                let x_row = &input[t * self.cols..(t + 1) * self.cols];
+                out[t * sub_n + local_n] = dot_f32_compat(&row_f32, x_row);
             }
-            match self.quant {
-                QuantType::F32 => {
-                    for (i, slot) in row_f32.iter_mut().enumerate() {
-                        let off = i * 4;
-                        *slot = f32::from_le_bytes([
-                            row_raw[off],
-                            row_raw[off + 1],
-                            row_raw[off + 2],
-                            row_raw[off + 3],
-                        ]);
-                    }
-                }
-                QuantType::F16 => {
-                    for (i, slot) in row_f32.iter_mut().enumerate() {
-                        let off = i * 2;
-                        *slot = f16_to_f32_portable(u16::from_le_bytes([
-                            row_raw[off],
-                            row_raw[off + 1],
-                        ]));
-                    }
-                }
-                QuantType::BF16 => {
-                    for (i, slot) in row_f32.iter_mut().enumerate() {
-                        let off = i * 2;
-                        *slot = bf16_to_f32_portable(u16::from_le_bytes([
-                            row_raw[off],
-                            row_raw[off + 1],
-                        ]));
-                    }
-                }
-                QuantType::Q4_0
-                | QuantType::Q8_0
-                | QuantType::Q4_K_M
-                | QuantType::Q5_K
-                | QuantType::Q6_K => {
-                    decode_quant_row_portable(self.quant, &row_raw, &mut row_f32);
-                }
-                other => {
-                    let _ = TensorShape::Inline([0; 8], 0);
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "mistral".to_owned(),
-                        reason: format!(
-                            "unsupported cached dense projection quant {}",
-                            other.as_str()
-                        ),
-                    });
-                }
-            }
-            *dst = dot_f32_compat(&row_f32, input);
         }
         Ok(())
+    }
+
+    fn gemv_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
+        self.gemm_rows_f32(out, input, 1, 0..self.rows)
     }
 }
 
@@ -511,16 +600,7 @@ impl CachedDenseProjection {
     ///
     /// Returns [`K3Error`] on dimension or buffer mismatch.
     pub fn gemv_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
-        #[cfg(feature = "with-kernels")]
-        {
-            let mut scratch = MistralActScratch::new();
-            scratch.prepare_row(input)?;
-            self.gemv_with_scratch(out, &scratch)
-        }
-        #[cfg(not(feature = "with-kernels"))]
-        {
-            self.inner.gemv_f32(out, input)
-        }
+        self.gemm_f32(out, input, 1)
     }
 
     /// Executes `out = weights * act` using a pre-quantized [`MistralActScratch`].
@@ -539,7 +619,79 @@ impl CachedDenseProjection {
         }
         #[cfg(not(feature = "with-kernels"))]
         {
+            if scratch.m != 1 {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "CachedDenseProjection::gemv".to_owned(),
+                    offset: 0,
+                    byte_len: size_of_val(out),
+                    buffer_len: self.rows() * size_of::<f32>(),
+                    reason: format!(
+                        "gemv_with_scratch requires scratch.m == 1, got {}",
+                        scratch.m
+                    ),
+                });
+            }
             self.inner.gemv_f32(out, &scratch.f32_buf)
+        }
+    }
+
+    /// Executes batched multi-token GEMM (`[m, cols] x [rows, cols]^T -> [m, rows]`) from `f32` inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on dimension or buffer mismatch.
+    pub fn gemm_f32(&self, out: &mut [f32], input: &[f32], m: usize) -> Result<(), K3Error> {
+        let mut scratch = MistralActScratch::new();
+        scratch.prepare_batch(input, m, self.cols())?;
+        self.gemm_with_scratch(out, &scratch)
+    }
+
+    /// Executes batched multi-token GEMM using pre-encoded [`MistralActScratch`] (`[M, K]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on dimension or buffer mismatch.
+    pub fn gemm_with_scratch(
+        &self,
+        out: &mut [f32],
+        scratch: &MistralActScratch,
+    ) -> Result<(), K3Error> {
+        self.gemm_rows_with_scratch(out, scratch, 0..self.rows())
+    }
+
+    /// Executes row-sliced batched multi-token GEMM (`[M, K] x [row_range, K]^T -> [M, row_range.len()]`)
+    /// via `gemm_repacked_rows` under `with-kernels` or portable row-reuse fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if `row_range` is out of bounds or dimensions mismatch.
+    pub fn gemm_rows_with_scratch(
+        &self,
+        out: &mut [f32],
+        scratch: &MistralActScratch,
+        row_range: core::ops::Range<usize>,
+    ) -> Result<(), K3Error> {
+        #[cfg(feature = "with-kernels")]
+        {
+            gemm_repacked_rows(out, &self.inner, &scratch.q8, row_range)
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        {
+            if scratch.batch_cols() != self.inner.cols {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "CachedDenseProjection::gemm".to_owned(),
+                    offset: 0,
+                    byte_len: size_of_val(out),
+                    buffer_len: self.inner.aligned_bytes(),
+                    reason: format!(
+                        "activation K ({}) != weight cols ({})",
+                        scratch.batch_cols(),
+                        self.inner.cols
+                    ),
+                });
+            }
+            self.inner
+                .gemm_rows_f32(out, &scratch.f32_buf, scratch.batch_m(), row_range)
         }
     }
 }
@@ -638,6 +790,52 @@ impl MistralLayerCache {
     #[must_use]
     pub const fn resident_repacked_bytes(&self) -> usize {
         self.resident_repacked_bytes
+    }
+
+    /// Returns the configured maximum resident byte budget for repacked projections.
+    #[must_use]
+    pub const fn max_repacked_bytes(&self) -> usize {
+        self.max_repacked_bytes
+    }
+
+    /// Returns the `F16`/`BF16` element threshold above which compact `16-bit` mode applies.
+    #[must_use]
+    pub const fn dense_f32_max_elements(&self) -> usize {
+        self.dense_f32_max_elems
+    }
+
+    /// Packs a transient projection (such as an active sparse-MoE expert) without inserting it into
+    /// resident cache storage when within remaining `max_repacked_bytes` headroom.
+    ///
+    /// Returns `Ok(None)` when `max_repacked_bytes == 0` or the repacked buffer exceeds remaining
+    /// headroom so callers can execute zero-copy fallback over `tensor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if `tensor` dimensions, alignment, byte bounds, or quant fail validation.
+    pub fn repack_transient_projection(
+        &self,
+        tensor: &TensorView<'_>,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> Result<Option<CachedDenseProjection>, K3Error> {
+        let (rows, cols) = resolve_2d_dims(tensor, expected_rows, expected_cols)?;
+        let remaining_budget = self
+            .max_repacked_bytes
+            .saturating_sub(self.resident_repacked_bytes);
+        if remaining_budget == 0 {
+            return Ok(None);
+        }
+        let proj = CachedDenseProjection::from_tensor_with_half_limit(
+            tensor,
+            rows,
+            cols,
+            self.dense_f32_max_elems,
+        )?;
+        if proj.aligned_bytes() > remaining_budget {
+            return Ok(None);
+        }
+        Ok(Some(proj))
     }
 
     /// Returns cumulative hit/miss/slice telemetry for this cache instance.
@@ -790,14 +988,53 @@ impl MistralLayerCache {
         input: &[f32],
         scratch: Option<&MistralActScratch>,
     ) -> Result<(), K3Error> {
-        match self.get_or_repack_dense(weights, tensor_name, output.len(), input.len())? {
+        self.matmul_dense_cached(weights, tensor_name, output, 1, input, scratch)
+    }
+
+    /// Executes batched `output[m, rows] = input[m, cols] * weights[tensor_name]^T`, caching
+    /// `tensor_name` in `128-byte` repacked storage when within budget and reusing `scratch`
+    /// (`[m, cols]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on missing tensor, zero/misaligned batch dimensions, or kernel failure.
+    pub fn matmul_dense_cached(
+        &mut self,
+        weights: &dyn ModelWeights,
+        tensor_name: &str,
+        output: &mut [f32],
+        m: usize,
+        input: &[f32],
+        scratch: Option<&MistralActScratch>,
+    ) -> Result<(), K3Error> {
+        if m == 0
+            || output.is_empty()
+            || input.is_empty()
+            || output.len() % m != 0
+            || input.len() % m != 0
+        {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: 0,
+                byte_len: size_of_val(output),
+                buffer_len: size_of_val(input),
+                reason: format!(
+                    "invalid batched GEMM dimensions: m={m}, out_len={}, in_len={}",
+                    output.len(),
+                    input.len()
+                ),
+            });
+        }
+        let rows = output.len() / m;
+        let cols = input.len() / m;
+        match self.get_or_repack_dense(weights, tensor_name, rows, cols)? {
             CachedProjectionLookup::Repacked(proj) => match scratch {
-                Some(act) => proj.gemv_with_scratch(output, act),
-                None => proj.gemv_f32(output, input),
+                Some(act) => proj.gemm_with_scratch(output, act),
+                None => proj.gemm_f32(output, input, m),
             },
             CachedProjectionLookup::DirectFallback => {
                 let tv = weights.tensor(tensor_name)?;
-                matvec_tensor(output, &tv, input)
+                matmul_tensor(output, &tv, m, input, rows, cols)
             }
         }
     }
@@ -1531,5 +1768,87 @@ mod tests {
         let logits_bounded = run_mixtral_prefill_with_cache(&recipe, &weights, &mut bounded_cache);
         assert!(logits_bounded.iter().all(|v| v.is_finite()));
         assert!(bounded_cache.stats().expert_zero_copy_slices > 0);
+    }
+
+    #[test]
+    fn test_batched_gemm_and_transient_expert_budget_miri() {
+        let mut weights = CacheTestWeights::default();
+        let m = 2;
+        let rows = 4;
+        let cols = 32;
+        for quant in [QuantType::F32, QuantType::Q4_0] {
+            let name = format!("blk.0.dense_{}.weight", quant.as_str());
+            weights.insert(
+                &name,
+                quant,
+                vec![cols, rows],
+                encode_matrix_bytes(quant, rows, cols, 91),
+            );
+        }
+
+        let input: Vec<f32> = (0..m * cols)
+            .map(|i| (f32::from(u8::try_from((i * 7 + 3) % 19).unwrap_or(0)) - 9.0) * 0.08)
+            .collect();
+        let mut cache = MistralLayerCache::new();
+        let mut scratch = MistralActScratch::new();
+
+        for quant in [QuantType::F32, QuantType::Q4_0] {
+            let name = format!("blk.0.dense_{}.weight", quant.as_str());
+            let mut batch_out = vec![0.0_f32; m * rows];
+            scratch
+                .prepare_batch(&input, m, cols)
+                .expect("prepare batch");
+            cache
+                .matmul_dense_cached(&weights, &name, &mut batch_out, m, &input, Some(&scratch))
+                .expect("batched matmul");
+
+            for t in 0..m {
+                let mut row_out = vec![0.0_f32; rows];
+                cache
+                    .matvec_dense_cached(
+                        &weights,
+                        &name,
+                        &mut row_out,
+                        &input[t * cols..(t + 1) * cols],
+                        None,
+                    )
+                    .expect("single-row matvec");
+                for (r, (&b, &s)) in batch_out[t * rows..(t + 1) * rows]
+                    .iter()
+                    .zip(&row_out)
+                    .enumerate()
+                {
+                    assert!(
+                        (b - s).abs() < 1e-4,
+                        "quant={quant:?} tok={t} row={r}: batch={b} single={s}"
+                    );
+                }
+            }
+        }
+
+        // Transient expert repacking honors remaining budget and never mutates resident bytes.
+        let before_resident = cache.resident_repacked_bytes();
+        assert!(before_resident > 0);
+        let dense_view = weights.tensor("blk.0.dense_F32.weight").unwrap();
+        let transient = cache
+            .repack_transient_projection(&dense_view, rows, cols)
+            .expect("transient repack")
+            .expect("fits in default 4 GiB headroom");
+        assert_eq!(cache.resident_repacked_bytes(), before_resident);
+
+        let mut t_out = vec![0.0_f32; m * rows];
+        transient
+            .gemm_f32(&mut t_out, &input, m)
+            .expect("transient gemm");
+        assert!(t_out.iter().all(|v| v.is_finite()));
+
+        // Exact tight headroom rejects oversized transient repack cleanly (`Ok(None)`).
+        let tight_cache = MistralLayerCache::new().with_max_repacked_bytes(32);
+        assert!(
+            tight_cache
+                .repack_transient_projection(&dense_view, rows, cols)
+                .expect("tight check")
+                .is_none()
+        );
     }
 }

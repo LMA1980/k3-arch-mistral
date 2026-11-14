@@ -6,9 +6,10 @@ use jero_core::{K3Error, QuantType, TensorView};
 pub use jero_kernels_rvv::RopeScalingConfig;
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    BaselineKernel, VectorKernel, bf16_to_f32_finite, dequantize_token_row, f16_to_f32_finite,
-    gqa_causal_attention_f32, precompute_rope_inv_freq, swiglu_f32, vec_dot_bf16, vec_dot_f16,
-    vec_dot_q4_0, vec_dot_q5_k, vec_dot_q6_k, vec_dot_q8_0,
+    AttentionMaskConfig, BaselineKernel, VectorKernel, bf16_to_f32_finite, dequantize_token_row,
+    f16_to_f32_finite, gqa_causal_attention_f32, gqa_causal_attention_prefill_f32,
+    precompute_rope_inv_freq, swiglu_f32, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0, vec_dot_q5_k,
+    vec_dot_q6_k, vec_dot_q8_0,
 };
 
 #[cfg(not(feature = "with-kernels"))]
@@ -195,35 +196,82 @@ pub(crate) fn matvec_tensor(
     weights: &TensorView<'_>,
     input: &[f32],
 ) -> Result<(), K3Error> {
-    let (rows, cols) = resolve_2d_dims(weights, output.len(), input.len())?;
+    matmul_tensor(output, weights, 1, input, output.len(), input.len())
+}
+
+/// Executes a batched 2D matrix multiplication `output[M, rows] = input[M, cols] * weights[rows, cols]^T`
+/// across all admitted quantizations.
+pub(crate) fn matmul_tensor(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    m: usize,
+    input: &[f32],
+    expected_rows: usize,
+    expected_cols: usize,
+) -> Result<(), K3Error> {
+    if m == 0 || expected_rows == 0 || expected_cols == 0 {
+        return Err(tensor_bounds_err(
+            weights,
+            0,
+            "batched matmul dimensions must be non-zero",
+        ));
+    }
+    let expected_in = m
+        .checked_mul(expected_cols)
+        .ok_or_else(|| tensor_bounds_err(weights, usize::MAX, "matmul input length overflow"))?;
+    let expected_out = m
+        .checked_mul(expected_rows)
+        .ok_or_else(|| tensor_bounds_err(weights, usize::MAX, "matmul output length overflow"))?;
+    if input.len() != expected_in || output.len() != expected_out {
+        return Err(tensor_bounds_err(
+            weights,
+            0,
+            &format!(
+                "matmul buffer mismatch: m={m}, in={} (expected {expected_in}), out={} (expected {expected_out})",
+                input.len(),
+                output.len()
+            ),
+        ));
+    }
+
+    let (rows, cols) = resolve_2d_dims(weights, expected_rows, expected_cols)?;
 
     if weights.quant() == QuantType::F32 {
-        return matvec_f32_rows(output, weights, input, rows, cols);
+        return matmul_f32_rows(output, weights, m, input, rows, cols);
     }
 
     #[cfg(feature = "with-kernels")]
     {
-        match weights.quant() {
-            QuantType::F16 => vec_dot_f16(output, weights, input),
-            QuantType::BF16 => vec_dot_bf16(output, weights, input),
-            QuantType::Q4_0 => vec_dot_q4_0(output, weights, input),
-            QuantType::Q4_K_M => BaselineKernel::new().vec_dot_q4_k_m(output, weights, input),
-            QuantType::Q5_K => vec_dot_q5_k(output, weights, input),
-            QuantType::Q6_K => vec_dot_q6_k(output, weights, input),
-            QuantType::Q8_0 => vec_dot_q8_0(output, weights, input),
-            other => Err(K3Error::CapabilityMismatch {
-                architecture: "mistral".to_owned(),
-                reason: format!(
-                    "unsupported quant type {} for matrix '{}'",
-                    other.as_str(),
-                    weights.name()
-                ),
-            }),
+        for t in 0..m {
+            let x_row = &input[t * cols..(t + 1) * cols];
+            let out_row = &mut output[t * rows..(t + 1) * rows];
+            match weights.quant() {
+                QuantType::F16 => vec_dot_f16(out_row, weights, x_row)?,
+                QuantType::BF16 => vec_dot_bf16(out_row, weights, x_row)?,
+                QuantType::Q4_0 => vec_dot_q4_0(out_row, weights, x_row)?,
+                QuantType::Q4_K_M => {
+                    BaselineKernel::new().vec_dot_q4_k_m(out_row, weights, x_row)?;
+                }
+                QuantType::Q5_K => vec_dot_q5_k(out_row, weights, x_row)?,
+                QuantType::Q6_K => vec_dot_q6_k(out_row, weights, x_row)?,
+                QuantType::Q8_0 => vec_dot_q8_0(out_row, weights, x_row)?,
+                other => {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: "mistral".to_owned(),
+                        reason: format!(
+                            "unsupported quant type {} for matrix '{}'",
+                            other.as_str(),
+                            weights.name()
+                        ),
+                    });
+                }
+            }
         }
+        Ok(())
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        matvec_portable(output, weights, input, rows, cols)
+        matmul_portable(output, weights, m, input, rows, cols)
     }
 }
 
@@ -333,9 +381,69 @@ pub(crate) fn gqa_attention_compat(
     }
 }
 
-fn matvec_f32_rows(
+/// Executes multi-token batched causal GQA prefill over `[m, n_heads_q, head_dim]` with optional
+/// sliding window and starting sequence offset `start_pos`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches gqa_causal_attention_prefill_f32 signature"
+)]
+pub(crate) fn gqa_causal_attention_prefill_compat(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    #[cfg(feature = "with-kernels")]
+    {
+        let config =
+            AttentionMaskConfig::causal(start_pos, scale).with_sliding_window(sliding_window);
+        gqa_causal_attention_prefill_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            config,
+            scores_scratch,
+        )
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        gqa_attention_prefill_portable(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            start_pos,
+            sliding_window,
+            scale,
+            scores_scratch,
+        )
+    }
+}
+
+fn matmul_f32_rows(
     output: &mut [f32],
     weights: &TensorView<'_>,
+    m: usize,
     input: &[f32],
     rows: usize,
     cols: usize,
@@ -351,7 +459,7 @@ fn matvec_f32_rows(
     }
 
     let mut row_buf = vec![0.0_f32; cols];
-    for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
+    for r in 0..rows {
         let base = r * row_bytes;
         for (c, dst) in row_buf.iter_mut().enumerate() {
             let off = base + c * 4;
@@ -365,7 +473,10 @@ fn matvec_f32_rows(
             }
             *dst = val;
         }
-        *out_slot = dot_f32_compat(&row_buf, input);
+        for t in 0..m {
+            let x_row = &input[t * cols..(t + 1) * cols];
+            output[t * rows + r] = dot_f32_compat(&row_buf, x_row);
+        }
     }
     Ok(())
 }
@@ -544,9 +655,10 @@ fn dequantize_row_portable(
 }
 
 #[cfg(not(feature = "with-kernels"))]
-fn matvec_portable(
+fn matmul_portable(
     output: &mut [f32],
     weights: &TensorView<'_>,
+    m: usize,
     input: &[f32],
     rows: usize,
     cols: usize,
@@ -585,9 +697,12 @@ fn matvec_portable(
     }
 
     let mut row_buf = vec![0.0_f32; cols];
-    for (r, out_slot) in output.iter_mut().enumerate().take(rows) {
+    for r in 0..rows {
         dequantize_row_portable(weights, r, &mut row_buf)?;
-        *out_slot = dot_f32_compat(&row_buf, input);
+        for t in 0..m {
+            let x_row = &input[t * cols..(t + 1) * cols];
+            output[t * rows + r] = dot_f32_compat(&row_buf, x_row);
+        }
     }
     Ok(())
 }
@@ -852,6 +967,30 @@ fn precompute_rope_inv_freq_portable(
 }
 
 #[cfg(not(feature = "with-kernels"))]
+fn softmax_scores_portable(scores: &mut [f32]) {
+    let mut max_score = f32::NEG_INFINITY;
+    for &s in scores.iter() {
+        if s > max_score {
+            max_score = s;
+        }
+    }
+    let mut sum_exp = 0.0_f32;
+    for s in scores.iter_mut() {
+        let w = (*s - max_score).exp();
+        *s = w;
+        sum_exp += w;
+    }
+    let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
+        1.0_f32 / sum_exp
+    } else {
+        0.0
+    };
+    for s in scores.iter_mut() {
+        *s *= inv_sum;
+    }
+}
+
+#[cfg(not(feature = "with-kernels"))]
 #[expect(
     clippy::too_many_arguments,
     reason = "matches gqa_causal_attention_f32 signature"
@@ -902,33 +1041,136 @@ fn gqa_attention_portable(
     for h in 0..n_heads_q {
         let kv_h = h / kv_group_size;
         let q_head = &q[h * head_dim..(h + 1) * head_dim];
-        let mut max_score = f32::NEG_INFINITY;
         for (t, score_slot) in scores.iter_mut().enumerate() {
             let k_off = t * kv_stride + kv_h * head_dim;
-            let s = dot_f32_compat(q_head, &k_cache[k_off..k_off + head_dim]) * scale;
-            *score_slot = s;
-            if s > max_score {
-                max_score = s;
-            }
+            *score_slot = dot_f32_compat(q_head, &k_cache[k_off..k_off + head_dim]) * scale;
         }
-        let mut sum_exp = 0.0_f32;
-        for s in &mut scores {
-            let w = (*s - max_score).exp();
-            *s = w;
-            sum_exp += w;
-        }
-        let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
-            1.0_f32 / sum_exp
-        } else {
-            0.0
-        };
+        softmax_scores_portable(&mut scores);
         let out_head = &mut out[h * head_dim..(h + 1) * head_dim];
         out_head.fill(0.0);
-        for (t, &w) in scores.iter().enumerate() {
-            let prob = w * inv_sum;
+        for (t, &prob) in scores.iter().enumerate() {
+            if prob == 0.0_f32 {
+                continue;
+            }
             let v_off = t * kv_stride + kv_h * head_dim;
             for (dst, &v_val) in out_head.iter_mut().zip(&v_cache[v_off..v_off + head_dim]) {
                 *dst += prob * v_val;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches gqa_causal_attention_prefill_f32 signature"
+)]
+fn gqa_attention_prefill_portable(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    if m == 0 || n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0 || total_seq_len == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: "GQA prefill dimensions must be non-zero".to_owned(),
+        });
+    }
+    if n_heads_q % n_heads_kv != 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: format!("n_heads_q ({n_heads_q}) not divisible by n_heads_kv ({n_heads_kv})"),
+        });
+    }
+    if sliding_window == Some(0) || !scale.is_finite() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: "invalid GQA sliding window or non-finite scale".to_owned(),
+        });
+    }
+    let query_end = start_pos
+        .checked_add(m)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_start_pos".to_owned(),
+            offset: start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: "start_pos + m overflow".to_owned(),
+        })?;
+    if query_end > total_seq_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_start_pos".to_owned(),
+            offset: start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: format!("start_pos + m ({query_end}) > total_seq_len ({total_seq_len})"),
+        });
+    }
+    let q_expected = m * n_heads_q * head_dim;
+    let kv_stride = n_heads_kv * head_dim;
+    let kv_expected = total_seq_len * kv_stride;
+    let min_scratch = sliding_window.map_or(query_end, |w| w.min(query_end));
+    if q.len() != q_expected
+        || out.len() != q_expected
+        || k_cache.len() < kv_expected
+        || v_cache.len() < kv_expected
+        || scores_scratch.len() < min_scratch
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_prefill".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(k_cache),
+            buffer_len: kv_expected * size_of::<f32>(),
+            reason: "GQA prefill buffer or scratch length mismatch".to_owned(),
+        });
+    }
+
+    let group_size = n_heads_q / n_heads_kv;
+    for kv_h in 0..n_heads_kv {
+        let kv_head_offset = kv_h * head_dim;
+        for m_idx in 0..m {
+            let query_pos = start_pos + m_idx;
+            let valid_end = (query_pos + 1).min(total_seq_len);
+            let valid_start =
+                sliding_window.map_or(0, |w| query_pos.saturating_add(1).saturating_sub(w));
+            let active_len = valid_end.saturating_sub(valid_start);
+            let score_buf = &mut scores_scratch[..active_len];
+
+            for g in 0..group_size {
+                let q_h = kv_h * group_size + g;
+                let q_slice = &q[(m_idx * n_heads_q + q_h) * head_dim..][..head_dim];
+                for (slot, s) in score_buf.iter_mut().zip(valid_start..valid_end) {
+                    let kv_off = s * kv_stride + kv_head_offset;
+                    *slot = dot_f32_compat(q_slice, &k_cache[kv_off..kv_off + head_dim]) * scale;
+                }
+                if active_len > 0 {
+                    softmax_scores_portable(score_buf);
+                }
+                let out_slice = &mut out[(m_idx * n_heads_q + q_h) * head_dim..][..head_dim];
+                out_slice.fill(0.0_f32);
+                for (s, &weight) in (valid_start..valid_end).zip(score_buf.iter()) {
+                    if weight == 0.0_f32 {
+                        continue;
+                    }
+                    let kv_off = s * kv_stride + kv_head_offset;
+                    for (dst, &v_val) in out_slice
+                        .iter_mut()
+                        .zip(&v_cache[kv_off..kv_off + head_dim])
+                    {
+                        *dst += weight * v_val;
+                    }
+                }
             }
         }
     }
