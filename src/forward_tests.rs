@@ -12,7 +12,64 @@ use jero_core::{
 
 use crate::kernels_compat::{dequantize_embedding_row, matvec_tensor};
 use crate::recipe::apply_norm_rope_inplace;
+use crate::repack_cache::MistralLayerCache;
 use crate::{MistralRecipe, RopeScalingConfig, route_top2_experts};
+
+/// Asserts logit parity against an `f32`-activation scalar reference.
+///
+/// Exact float formats (`F32`, `F16`, `BF16`) and non-repacked `DirectFallback`
+/// runs must match within `< 1e-3`. With `with-kernels` enabled, quantized
+/// dense projections dynamically quantize activations to `Q8`, so normalized
+/// delta (`< 1.5e-2`) and cosine similarity (`> 0.999`) are verified alongside
+/// strict `< 1e-3` `DirectFallback` parity.
+fn assert_logits_parity(
+    label: &str,
+    quant: QuantType,
+    got: &[f32],
+    expected: &[f32],
+    strict_float_parity: bool,
+) {
+    assert_eq!(got.len(), expected.len(), "{label} length mismatch");
+    let use_q8_bounds = cfg!(feature = "with-kernels")
+        && !strict_float_parity
+        && !matches!(quant, QuantType::F32 | QuantType::F16 | QuantType::BF16);
+
+    let mut dot = 0.0_f64;
+    let mut norm_g = 0.0_f64;
+    let mut norm_e = 0.0_f64;
+    let mut diff_sq = 0.0_f64;
+    for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            g.is_finite() && e.is_finite(),
+            "{label} non-finite at [{i}]"
+        );
+        if !use_q8_bounds {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "{label} ({quant:?}) logit[{i}] mismatch: got {g}, expected {e}"
+            );
+        }
+        let gf = f64::from(g);
+        let ef = f64::from(e);
+        dot += gf * ef;
+        norm_g += gf * gf;
+        norm_e += ef * ef;
+        diff_sq += (gf - ef) * (gf - ef);
+    }
+
+    if use_q8_bounds {
+        let cosine = if norm_g > 1e-9 && norm_e > 1e-9 {
+            dot / (norm_g.sqrt() * norm_e.sqrt())
+        } else {
+            1.0
+        };
+        let l2_rel = diff_sq.sqrt() / norm_e.sqrt().max(1.0);
+        assert!(
+            cosine > 0.999 && l2_rel < 2e-2,
+            "{label} ({quant:?}) Q8-repacked parity failure: cosine={cosine}, l2_rel={l2_rel}, got={got:?}, expected={expected:?}"
+        );
+    }
+}
 
 struct StoredTensor {
     name: String,
@@ -886,12 +943,32 @@ fn test_non_k_quants_and_square_matrix_disambiguation_miri() {
     recipe.decode_step(&mut ctx, &weights).expect("decode");
 
     let ref_logits = reference_forward_sequence(&recipe, &[0_u32, 1], &weights);
-    for (i, (&got, &exp)) in ctx.logits().iter().zip(&ref_logits).enumerate() {
-        assert!(
-            (got - exp).abs() < 1e-3,
-            "Q4_0 logit[{i}] mismatch: got {got}, expected {exp}"
-        );
-    }
+    assert_logits_parity(
+        "Q4_0 default path",
+        QuantType::Q4_0,
+        ctx.logits(),
+        &ref_logits,
+        false,
+    );
+
+    let mut fb_cache = MistralLayerCache::new().with_max_repacked_bytes(0);
+    let mut kv_fb = vec![0.0_f32; 2 * 4 * 16];
+    let mut logits_fb = vec![0.0_f32; recipe.vocab_size];
+    let mut ctx_fb = ExecutionContext::new(&[0_u32], 4, &mut logits_fb, &mut kv_fb).unwrap();
+    recipe
+        .prefill_step_with_cache(&mut ctx_fb, &weights, &mut fb_cache)
+        .expect("fallback prefill");
+    ctx_fb.prepare_decode(1).unwrap();
+    recipe
+        .decode_step_with_cache(&mut ctx_fb, &weights, &mut fb_cache)
+        .expect("fallback decode");
+    assert_logits_parity(
+        "Q4_0 DirectFallback path",
+        QuantType::Q4_0,
+        ctx_fb.logits(),
+        &ref_logits,
+        true,
+    );
 }
 
 #[test]
@@ -996,17 +1073,34 @@ fn test_mixtral_router_matvec_packed_3d_vs_split_2d_experts_miri() {
         .expect("split moe");
 
     let ref_logits = reference_forward_sequence(&recipe, &[1_u32], &w_packed);
-    for (i, &ref_val) in ref_logits.iter().enumerate() {
+    for (i, &split_val) in ctx_split.logits().iter().enumerate() {
         assert!(
-            (ctx_packed.logits()[i] - ctx_split.logits()[i]).abs() < 1e-6,
+            (ctx_packed.logits()[i] - split_val).abs() < 1e-6,
             "packed vs split MoE divergence for {quant:?}"
         );
-        assert!(
-            (ctx_packed.logits()[i] - ref_val).abs() < 1e-3,
-            "Mixtral MoE ref divergence for {quant:?} [{i}]: {} vs {ref_val}",
-            ctx_packed.logits()[i]
-        );
     }
+    assert_logits_parity(
+        "Mixtral MoE default path",
+        quant,
+        ctx_packed.logits(),
+        &ref_logits,
+        false,
+    );
+
+    let mut fb_cache = MistralLayerCache::new().with_max_repacked_bytes(0);
+    let mut kv_fb = vec![0.0_f32; 2 * 4 * 16];
+    let mut logits_fb = vec![0.0_f32; 2];
+    let mut ctx_fb = ExecutionContext::new(&[1_u32], 4, &mut logits_fb, &mut kv_fb).unwrap();
+    recipe
+        .prefill_step_with_cache(&mut ctx_fb, &w_packed, &mut fb_cache)
+        .expect("fallback moe prefill");
+    assert_logits_parity(
+        "Mixtral MoE DirectFallback path",
+        quant,
+        ctx_fb.logits(),
+        &ref_logits,
+        true,
+    );
 }
 
 #[test]

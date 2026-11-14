@@ -8,14 +8,16 @@
 
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, TensorDescriptor, TensorView,
+    ModelMetadata, ModelWeights, QuantType, TensorDescriptor,
 };
 
+use crate::admission::validate_token_id_in_vocab;
 pub use crate::kernels_compat::RopeScalingConfig;
 use crate::kernels_compat::{
-    decode_norm_weights, dequantize_embedding_row, gqa_attention_compat, matvec_tensor,
-    resolve_2d_dims, rmsnorm_compat, rope_inv_freq_compat, swiglu_compat, tensor_bounds_err,
+    dequantize_embedding_row, gqa_attention_compat, matvec_tensor, resolve_2d_dims, rmsnorm_compat,
+    rope_inv_freq_compat, swiglu_compat, tensor_bounds_err,
 };
+use crate::repack_cache::{MistralActScratch, MistralLayerCache, with_shared_model_cache};
 
 #[derive(Debug, Clone, Copy)]
 struct MistralGeometry {
@@ -348,7 +350,206 @@ impl MistralRecipe {
         }
         recipe.rope_scaling = parse_gguf_rope_scaling(gguf, arch)?;
 
+        if recipe.vocab_size > 0 {
+            for (label, key) in [
+                ("bos_token_id", "tokenizer.ggml.bos_token_id"),
+                ("eos_token_id", "tokenizer.ggml.eos_token_id"),
+                ("eot_token_id", "tokenizer.ggml.eot_token_id"),
+                ("padding_token_id", "tokenizer.ggml.padding_token_id"),
+            ] {
+                if let Some(tok_id) = gguf.metadata_value(key).and_then(GgufValue::as_u32) {
+                    validate_token_id_in_vocab(arch, label, tok_id, recipe.vocab_size)?;
+                }
+            }
+        }
+
         Ok(recipe)
+    }
+
+    /// Pre-decodes 1D `RMSNorm` scales (`attn_norm`, `ffn_norm`, `output_norm`) and populates
+    /// `128-byte`-aligned dense projections (`Q/K/V/O`, dense `Gate/Up/Down`, or `MoE` router)
+    /// in `cache` while keeping stacked `3D` `_exps` tensors zero-copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if geometry is invalid or any required layer tensor fails verification.
+    pub fn warm_layer_cache(
+        &self,
+        weights: &dyn ModelWeights,
+        cache: &mut MistralLayerCache,
+    ) -> Result<(), K3Error> {
+        let geom = self.effective_geometry()?;
+        cache.bind_weights(weights)?;
+        let _ = cache.get_or_decode_norm(weights, "output_norm.weight", geom.hidden_dim)?;
+
+        for layer in 0..geom.num_layers {
+            let _ = cache.get_or_decode_norm(
+                weights,
+                &format!("blk.{layer}.attn_norm.weight"),
+                geom.hidden_dim,
+            )?;
+            let _ = cache.get_or_repack_dense(
+                weights,
+                &format!("blk.{layer}.attn_q.weight"),
+                geom.total_q,
+                geom.hidden_dim,
+            )?;
+            let _ = cache.get_or_repack_dense(
+                weights,
+                &format!("blk.{layer}.attn_k.weight"),
+                geom.total_kv,
+                geom.hidden_dim,
+            )?;
+            let _ = cache.get_or_repack_dense(
+                weights,
+                &format!("blk.{layer}.attn_v.weight"),
+                geom.total_kv,
+                geom.hidden_dim,
+            )?;
+            let _ = cache.get_or_repack_dense(
+                weights,
+                &format!("blk.{layer}.attn_output.weight"),
+                geom.hidden_dim,
+                geom.total_q,
+            )?;
+            let _ = cache.get_or_decode_norm(
+                weights,
+                &format!("blk.{layer}.ffn_norm.weight"),
+                geom.hidden_dim,
+            )?;
+
+            if let Some((n_exp, _top_k)) = geom.moe {
+                let _ = cache.get_or_repack_dense(
+                    weights,
+                    &format!("blk.{layer}.ffn_gate_inp.weight"),
+                    n_exp,
+                    geom.hidden_dim,
+                )?;
+            } else {
+                let _ = cache.get_or_repack_dense(
+                    weights,
+                    &format!("blk.{layer}.ffn_gate.weight"),
+                    geom.ffn_dim,
+                    geom.hidden_dim,
+                )?;
+                let _ = cache.get_or_repack_dense(
+                    weights,
+                    &format!("blk.{layer}.ffn_up.weight"),
+                    geom.ffn_dim,
+                    geom.hidden_dim,
+                )?;
+                let _ = cache.get_or_repack_dense(
+                    weights,
+                    &format!("blk.{layer}.ffn_down.weight"),
+                    geom.hidden_dim,
+                    geom.ffn_dim,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Executes prefill forward pass using a caller-owned [`MistralLayerCache`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on invalid context bounds, missing tensors, or kernel errors.
+    pub fn prefill_step_with_cache(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &mut MistralLayerCache,
+    ) -> Result<(), K3Error> {
+        let prompt_tokens = ctx.prompt_tokens().to_vec();
+        let prompt_len = prompt_tokens.len();
+        let start_pos = ctx.position();
+        let seq_len = start_pos + prompt_len;
+        if weights.tensor_count() == 0 {
+            return self.prefill_step(ctx, weights);
+        }
+        if prompt_tokens.is_empty() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture_id().to_owned(),
+                reason: "prefill_step requires at least one prompt token".to_owned(),
+            });
+        }
+        if seq_len > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: seq_len,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+        let geom = self.effective_geometry()?;
+        let kv_geom = ctx.kv_geometry();
+        let mut act_scratch = MistralActScratch::new();
+        let mut last_hidden = Vec::new();
+        {
+            let kv_cache = ctx.kv_cache_mut();
+            for (i, &tok) in prompt_tokens.iter().enumerate() {
+                last_hidden = self.execute_real_token_step_with_cache(
+                    geom,
+                    tok,
+                    start_pos + i,
+                    seq_len,
+                    kv_cache,
+                    kv_geom,
+                    weights,
+                    cache,
+                    &mut act_scratch,
+                )?;
+            }
+        }
+        project_lm_head(&last_hidden, geom, ctx.logits_mut(), weights)?;
+        ctx.advance_position(prompt_len)?;
+        Ok(())
+    }
+
+    /// Executes single-token decode step using a caller-owned [`MistralLayerCache`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if no decode token is staged, context bounds are exceeded, or a tensor
+    /// fails validation.
+    pub fn decode_step_with_cache(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &mut MistralLayerCache,
+    ) -> Result<(), K3Error> {
+        if weights.tensor_count() == 0 {
+            return self.decode_step(ctx, weights);
+        }
+        let token = ctx
+            .decode_token()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: self.architecture_id().to_owned(),
+                reason: "decode_step called without a staged decode token".to_owned(),
+            })?;
+        let pos = ctx.position();
+        let seq_len = pos + 1;
+        if seq_len > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: seq_len,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+        let geom = self.effective_geometry()?;
+        let kv_geom = ctx.kv_geometry();
+        let mut act_scratch = MistralActScratch::new();
+        let hidden = self.execute_real_token_step_with_cache(
+            geom,
+            token,
+            pos,
+            seq_len,
+            ctx.kv_cache_mut(),
+            kv_geom,
+            weights,
+            cache,
+            &mut act_scratch,
+        )?;
+        project_lm_head(&hidden, geom, ctx.logits_mut(), weights)?;
+        ctx.advance_position(1)?;
+        Ok(())
     }
 
     fn effective_geometry(&self) -> Result<MistralGeometry, K3Error> {
@@ -423,9 +624,9 @@ impl MistralRecipe {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "internal single-token step coordinates geometry, KV cache, and weights"
+        reason = "internal single-token step coordinates geometry, KV cache, weights, and layer cache"
     )]
-    fn execute_real_token_step(
+    fn execute_real_token_step_with_cache(
         &self,
         geom: MistralGeometry,
         token_id: u32,
@@ -434,6 +635,8 @@ impl MistralRecipe {
         kv_cache: &mut [f32],
         kv_geom_override: Option<KvGeometry>,
         weights: &dyn ModelWeights,
+        cache: &mut MistralLayerCache,
+        act_scratch: &mut MistralActScratch,
     ) -> Result<Vec<f32>, K3Error> {
         let mut hidden = embed_real_token(token_id, geom.hidden_dim, geom.vocab_size, weights)?;
         let inv_freq = rope_inv_freq_compat(
@@ -444,88 +647,70 @@ impl MistralRecipe {
         )?;
 
         let mut kv_view = build_real_kv_view(geom, seq_len, kv_cache, kv_geom_override)?;
-        let mut attn_norm = vec![0.0_f32; geom.hidden_dim];
-        let mut norm_weights = vec![0.0_f32; geom.hidden_dim];
-        let mut q_vec = vec![0.0_f32; geom.total_q];
-        let mut k_vec = vec![0.0_f32; geom.total_kv];
-        let mut v_vec = vec![0.0_f32; geom.total_kv];
-        let mut attn_out = vec![0.0_f32; geom.total_q];
-        let mut o_proj = vec![0.0_f32; geom.hidden_dim];
-        let mut ffn_norm = vec![0.0_f32; geom.hidden_dim];
+        let mut bufs = LayerStepBuffers::new(geom);
 
         #[expect(clippy::cast_precision_loss, reason = "head_dim fits cleanly in f32")]
         let attn_scale = 1.0_f32 / (geom.head_dim as f32).sqrt();
+        let step_ctx = CachedLayerStepCtx {
+            geom,
+            pos,
+            attn_scale,
+            inv_freq: &inv_freq,
+            weights,
+        };
 
         for layer in 0..geom.num_layers {
-            apply_layer_rmsnorm(
-                &format!("blk.{layer}.attn_norm.weight"),
-                &hidden,
-                &mut norm_weights,
-                &mut attn_norm,
-                geom.rms_eps,
-                weights,
+            execute_layer_attention_cached(
+                &step_ctx,
+                layer,
+                &mut kv_view,
+                &mut bufs,
+                &mut hidden,
+                cache,
+                act_scratch,
             )?;
 
-            let q_w = weights.tensor(&format!("blk.{layer}.attn_q.weight"))?;
-            let k_w = weights.tensor(&format!("blk.{layer}.attn_k.weight"))?;
-            let v_w = weights.tensor(&format!("blk.{layer}.attn_v.weight"))?;
-            matvec_tensor(&mut q_vec, &q_w, &attn_norm)?;
-            matvec_tensor(&mut k_vec, &k_w, &attn_norm)?;
-            matvec_tensor(&mut v_vec, &v_w, &attn_norm)?;
-
-            apply_norm_rope_inplace(&mut q_vec, geom.head_dim, pos, &inv_freq)?;
-            apply_norm_rope_inplace(&mut k_vec, geom.head_dim, pos, &inv_freq)?;
-
-            {
-                let (k_slot, v_slot) = kv_view.write_pos_range(layer, pos)?;
-                k_slot.copy_from_slice(&k_vec);
-                v_slot.copy_from_slice(&v_vec);
-            }
-            let valid_range = kv_view.valid_token_range(pos + 1)?;
-            let valid_len = valid_range.len();
-            let (k_valid, v_valid) = kv_view.valid_kv_range(layer, pos + 1)?;
-            gqa_attention_compat(
-                &mut attn_out,
-                &q_vec,
-                k_valid,
-                v_valid,
-                geom.n_heads_q,
-                geom.n_heads_kv,
-                geom.head_dim,
-                valid_len,
-                attn_scale,
-            )?;
-
-            let o_w = weights.tensor(&format!("blk.{layer}.attn_output.weight"))?;
-            matvec_tensor(&mut o_proj, &o_w, &attn_out)?;
-            for (h, &delta) in hidden.iter_mut().zip(&o_proj) {
-                *h += delta;
-            }
-
-            apply_layer_rmsnorm(
+            apply_layer_rmsnorm_cached(
                 &format!("blk.{layer}.ffn_norm.weight"),
                 &hidden,
-                &mut norm_weights,
-                &mut ffn_norm,
+                &mut bufs.ffn_norm,
                 geom.rms_eps,
                 weights,
+                cache,
             )?;
 
             if let Some((n_exp, top_k)) = geom.moe {
-                execute_moe_ffn(layer, geom, n_exp, top_k, &ffn_norm, &mut hidden, weights)?;
+                execute_moe_ffn_cached(
+                    layer,
+                    geom,
+                    n_exp,
+                    top_k,
+                    &bufs.ffn_norm,
+                    &mut hidden,
+                    weights,
+                    cache,
+                )?;
             } else {
-                execute_dense_ffn(layer, geom.ffn_dim, &ffn_norm, &mut hidden, weights)?;
+                execute_dense_ffn_cached(
+                    layer,
+                    geom.ffn_dim,
+                    &bufs.ffn_norm,
+                    &mut hidden,
+                    weights,
+                    cache,
+                    act_scratch,
+                )?;
             }
         }
 
         let mut final_hidden = vec![0.0_f32; geom.hidden_dim];
-        apply_layer_rmsnorm(
+        apply_layer_rmsnorm_cached(
             "output_norm.weight",
             &hidden,
-            &mut norm_weights,
             &mut final_hidden,
             geom.rms_eps,
             weights,
+            cache,
         )?;
 
         Ok(final_hidden)
@@ -600,47 +785,15 @@ impl ArchRecipe for MistralRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
+        if weights.tensor_count() > 0 {
+            return with_shared_model_cache(weights, |cache| {
+                self.prefill_step_with_cache(ctx, weights, cache)
+            });
+        }
+
         let prompt_tokens = ctx.prompt_tokens().to_vec();
         let prompt_len = prompt_tokens.len();
         let start_pos = ctx.position();
-        let seq_len = start_pos + prompt_len;
-        let has_real_weights = weights.tensor_count() > 0;
-
-        if has_real_weights {
-            if prompt_tokens.is_empty() {
-                return Err(K3Error::CapabilityMismatch {
-                    architecture: self.architecture_id().to_owned(),
-                    reason: "prefill_step requires at least one prompt token".to_owned(),
-                });
-            }
-            if seq_len > ctx.n_ctx() {
-                return Err(K3Error::ContextLengthExceeded {
-                    requested_tokens: seq_len,
-                    max_context_tokens: ctx.n_ctx(),
-                });
-            }
-            let geom = self.effective_geometry()?;
-            let kv_geom = ctx.kv_geometry();
-            let mut last_hidden = Vec::new();
-            {
-                let kv_cache = ctx.kv_cache_mut();
-                for (i, &tok) in prompt_tokens.iter().enumerate() {
-                    last_hidden = self.execute_real_token_step(
-                        geom,
-                        tok,
-                        start_pos + i,
-                        seq_len,
-                        kv_cache,
-                        kv_geom,
-                        weights,
-                    )?;
-                }
-            }
-            project_lm_head(&last_hidden, geom, ctx.logits_mut(), weights)?;
-            ctx.advance_position(prompt_len)?;
-            return Ok(());
-        }
-
         let mut last_hidden = Vec::new();
         {
             let kv_cache = ctx.kv_cache_mut();
@@ -664,6 +817,12 @@ impl ArchRecipe for MistralRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
+        if weights.tensor_count() > 0 {
+            return with_shared_model_cache(weights, |cache| {
+                self.decode_step_with_cache(ctx, weights, cache)
+            });
+        }
+
         let token = ctx
             .decode_token()
             .ok_or_else(|| K3Error::CapabilityMismatch {
@@ -672,30 +831,6 @@ impl ArchRecipe for MistralRecipe {
             })?;
 
         let pos = ctx.position();
-        let seq_len = pos + 1;
-        if weights.tensor_count() > 0 {
-            if seq_len > ctx.n_ctx() {
-                return Err(K3Error::ContextLengthExceeded {
-                    requested_tokens: seq_len,
-                    max_context_tokens: ctx.n_ctx(),
-                });
-            }
-            let geom = self.effective_geometry()?;
-            let kv_geom = ctx.kv_geometry();
-            let hidden = self.execute_real_token_step(
-                geom,
-                token,
-                pos,
-                seq_len,
-                ctx.kv_cache_mut(),
-                kv_geom,
-                weights,
-            )?;
-            project_lm_head(&hidden, geom, ctx.logits_mut(), weights)?;
-            ctx.advance_position(1)?;
-            return Ok(());
-        }
-
         let hidden = self.execute_synthetic_token_step(token, pos, ctx.kv_cache_mut())?;
         ctx.advance_position(1)?;
         let logits = ctx.logits_mut();
@@ -979,39 +1114,55 @@ fn build_real_kv_view(
     KvCacheView::new(kv_cache, kv_geom)
 }
 
-fn apply_layer_rmsnorm(
+fn apply_layer_rmsnorm_cached(
     tensor_name: &str,
     input: &[f32],
-    weight_buf: &mut [f32],
     out: &mut [f32],
     eps: f32,
     weights: &dyn ModelWeights,
+    cache: &mut MistralLayerCache,
 ) -> Result<(), K3Error> {
-    let tensor = weights.tensor(tensor_name)?;
-    decode_norm_weights(&tensor, weight_buf)?;
-    rmsnorm_compat(out, input, weight_buf, eps)
+    let norm_weights = cache.get_or_decode_norm(weights, tensor_name, input.len())?;
+    rmsnorm_compat(out, input, &norm_weights, eps)
 }
 
-fn execute_dense_ffn(
+fn execute_dense_ffn_cached(
     layer: usize,
     ffn_dim: usize,
     ffn_norm: &[f32],
     hidden: &mut [f32],
     weights: &dyn ModelWeights,
+    cache: &mut MistralLayerCache,
+    act_scratch: &mut MistralActScratch,
 ) -> Result<(), K3Error> {
-    let gate_w = weights.tensor(&format!("blk.{layer}.ffn_gate.weight"))?;
-    let up_w = weights.tensor(&format!("blk.{layer}.ffn_up.weight"))?;
-    let down_w = weights.tensor(&format!("blk.{layer}.ffn_down.weight"))?;
-
     let mut gate = vec![0.0_f32; ffn_dim];
     let mut up = vec![0.0_f32; ffn_dim];
     let mut act = vec![0.0_f32; ffn_dim];
     let mut down = vec![0.0_f32; hidden.len()];
 
-    matvec_tensor(&mut gate, &gate_w, ffn_norm)?;
-    matvec_tensor(&mut up, &up_w, ffn_norm)?;
+    act_scratch.prepare_row(ffn_norm)?;
+    cache.matvec_dense_cached(
+        weights,
+        &format!("blk.{layer}.ffn_gate.weight"),
+        &mut gate,
+        ffn_norm,
+        Some(act_scratch),
+    )?;
+    cache.matvec_dense_cached(
+        weights,
+        &format!("blk.{layer}.ffn_up.weight"),
+        &mut up,
+        ffn_norm,
+        Some(act_scratch),
+    )?;
     swiglu_compat(&mut act, &gate, &up)?;
-    matvec_tensor(&mut down, &down_w, &act)?;
+    cache.matvec_dense_cached(
+        weights,
+        &format!("blk.{layer}.ffn_down.weight"),
+        &mut down,
+        &act,
+        None,
+    )?;
 
     for (h, &d) in hidden.iter_mut().zip(&down) {
         *h += d;
@@ -1019,7 +1170,11 @@ fn execute_dense_ffn(
     Ok(())
 }
 
-fn execute_moe_ffn(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "coordinates layer geometry, top-k expert slicing, and cached router dispatch"
+)]
+fn execute_moe_ffn_cached(
     layer: usize,
     geom: MistralGeometry,
     n_exp: usize,
@@ -1027,10 +1182,16 @@ fn execute_moe_ffn(
     ffn_norm: &[f32],
     hidden: &mut [f32],
     weights: &dyn ModelWeights,
+    cache: &mut MistralLayerCache,
 ) -> Result<(), K3Error> {
-    let router_w = weights.tensor(&format!("blk.{layer}.ffn_gate_inp.weight"))?;
     let mut router_logits = vec![0.0_f32; n_exp];
-    matvec_tensor(&mut router_logits, &router_w, ffn_norm)?;
+    cache.matvec_dense_cached(
+        weights,
+        &format!("blk.{layer}.ffn_gate_inp.weight"),
+        &mut router_logits,
+        ffn_norm,
+        None,
+    )?;
     let selected = route_topk_experts(&router_logits, top_k)?;
 
     let mut gate = vec![0.0_f32; geom.ffn_dim];
@@ -1039,9 +1200,33 @@ fn execute_moe_ffn(
     let mut down = vec![0.0_f32; geom.hidden_dim];
 
     for (expert_idx, gate_weight) in selected {
-        let g_w = lookup_expert_tensor(weights, layer, "gate", expert_idx, n_exp)?;
-        let u_w = lookup_expert_tensor(weights, layer, "up", expert_idx, n_exp)?;
-        let d_w = lookup_expert_tensor(weights, layer, "down", expert_idx, n_exp)?;
+        let g_w = cache.slice_expert_projection(
+            weights,
+            layer,
+            "gate",
+            expert_idx,
+            n_exp,
+            geom.ffn_dim,
+            geom.hidden_dim,
+        )?;
+        let u_w = cache.slice_expert_projection(
+            weights,
+            layer,
+            "up",
+            expert_idx,
+            n_exp,
+            geom.ffn_dim,
+            geom.hidden_dim,
+        )?;
+        let d_w = cache.slice_expert_projection(
+            weights,
+            layer,
+            "down",
+            expert_idx,
+            n_exp,
+            geom.hidden_dim,
+            geom.ffn_dim,
+        )?;
 
         matvec_tensor(&mut gate, &g_w, ffn_norm)?;
         matvec_tensor(&mut up, &u_w, ffn_norm)?;
@@ -1053,29 +1238,6 @@ fn execute_moe_ffn(
         }
     }
     Ok(())
-}
-
-fn lookup_expert_tensor<'a>(
-    weights: &'a dyn ModelWeights,
-    layer: usize,
-    proj: &str,
-    expert_idx: usize,
-    num_experts: usize,
-) -> Result<TensorView<'a>, K3Error> {
-    let stacked = format!("blk.{layer}.ffn_{proj}_exps.weight");
-    if weights.contains_tensor(&stacked) {
-        let view = weights.tensor(&stacked)?;
-        return view.slice_expert(expert_idx, num_experts);
-    }
-    let direct_indexed = format!("blk.{layer}.ffn_{proj}.{expert_idx}.weight");
-    if weights.contains_tensor(&direct_indexed) {
-        return weights.tensor(&direct_indexed);
-    }
-    let exps_indexed = format!("blk.{layer}.ffn_{proj}_exps.{expert_idx}.weight");
-    if weights.contains_tensor(&exps_indexed) {
-        return weights.tensor(&exps_indexed);
-    }
-    weights.tensor(&direct_indexed)
 }
 
 fn project_lm_head(
@@ -1147,6 +1309,115 @@ fn infer_descriptor_rows(desc: &TensorDescriptor, expected_cols: usize) -> Optio
     } else {
         None
     }
+}
+
+struct LayerStepBuffers {
+    attn_norm: Vec<f32>,
+    q_vec: Vec<f32>,
+    k_vec: Vec<f32>,
+    v_vec: Vec<f32>,
+    attn_out: Vec<f32>,
+    o_proj: Vec<f32>,
+    ffn_norm: Vec<f32>,
+}
+
+impl LayerStepBuffers {
+    fn new(geom: MistralGeometry) -> Self {
+        Self {
+            attn_norm: vec![0.0_f32; geom.hidden_dim],
+            q_vec: vec![0.0_f32; geom.total_q],
+            k_vec: vec![0.0_f32; geom.total_kv],
+            v_vec: vec![0.0_f32; geom.total_kv],
+            attn_out: vec![0.0_f32; geom.total_q],
+            o_proj: vec![0.0_f32; geom.hidden_dim],
+            ffn_norm: vec![0.0_f32; geom.hidden_dim],
+        }
+    }
+}
+
+struct CachedLayerStepCtx<'a> {
+    geom: MistralGeometry,
+    pos: usize,
+    attn_scale: f32,
+    inv_freq: &'a [f32],
+    weights: &'a dyn ModelWeights,
+}
+
+fn execute_layer_attention_cached(
+    ctx: &CachedLayerStepCtx<'_>,
+    layer: usize,
+    kv_view: &mut KvCacheView<'_>,
+    bufs: &mut LayerStepBuffers,
+    hidden: &mut [f32],
+    cache: &mut MistralLayerCache,
+    act_scratch: &mut MistralActScratch,
+) -> Result<(), K3Error> {
+    apply_layer_rmsnorm_cached(
+        &format!("blk.{layer}.attn_norm.weight"),
+        hidden,
+        &mut bufs.attn_norm,
+        ctx.geom.rms_eps,
+        ctx.weights,
+        cache,
+    )?;
+
+    act_scratch.prepare_row(&bufs.attn_norm)?;
+    cache.matvec_dense_cached(
+        ctx.weights,
+        &format!("blk.{layer}.attn_q.weight"),
+        &mut bufs.q_vec,
+        &bufs.attn_norm,
+        Some(act_scratch),
+    )?;
+    cache.matvec_dense_cached(
+        ctx.weights,
+        &format!("blk.{layer}.attn_k.weight"),
+        &mut bufs.k_vec,
+        &bufs.attn_norm,
+        Some(act_scratch),
+    )?;
+    cache.matvec_dense_cached(
+        ctx.weights,
+        &format!("blk.{layer}.attn_v.weight"),
+        &mut bufs.v_vec,
+        &bufs.attn_norm,
+        Some(act_scratch),
+    )?;
+
+    apply_norm_rope_inplace(&mut bufs.q_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
+    apply_norm_rope_inplace(&mut bufs.k_vec, ctx.geom.head_dim, ctx.pos, ctx.inv_freq)?;
+
+    {
+        let (k_slot, v_slot) = kv_view.write_pos_range(layer, ctx.pos)?;
+        k_slot.copy_from_slice(&bufs.k_vec);
+        v_slot.copy_from_slice(&bufs.v_vec);
+    }
+    let valid_range = kv_view.valid_token_range(ctx.pos + 1)?;
+    let valid_len = valid_range.len();
+    let (k_valid, v_valid) = kv_view.valid_kv_range(layer, ctx.pos + 1)?;
+    gqa_attention_compat(
+        &mut bufs.attn_out,
+        &bufs.q_vec,
+        k_valid,
+        v_valid,
+        ctx.geom.n_heads_q,
+        ctx.geom.n_heads_kv,
+        ctx.geom.head_dim,
+        valid_len,
+        ctx.attn_scale,
+    )?;
+
+    cache.matvec_dense_cached(
+        ctx.weights,
+        &format!("blk.{layer}.attn_output.weight"),
+        &mut bufs.o_proj,
+        &bufs.attn_out,
+        None,
+    )?;
+    for (h, &delta) in hidden.iter_mut().zip(&bufs.o_proj) {
+        *h += delta;
+    }
+    Ok(())
 }
 
 fn gguf_array_len(arr: &GgufArray<'_>) -> usize {
