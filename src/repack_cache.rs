@@ -1,4 +1,4 @@
-//! Model-scoped `128-byte`-aligned [`RepackedWeight`] dense projection cache, zero-copy 3D
+//! Model-scoped `128-byte`-aligned `RepackedWeight` dense projection cache, zero-copy 3D
 //! `_exps` expert slicer, and once-per-load 1D `RMSNorm` cache for `Mistral` / `Mistral3` /
 //! `Mixtral`.
 //!
@@ -357,7 +357,7 @@ impl PortableAlignedMatrix {
 
 /// Cached `128-byte`-aligned dense projection matrix descriptor.
 ///
-/// Wraps [`jero_kernels_rvv::RepackedWeight`] under `with-kernels` and a `128-byte`-aligned
+/// Wraps `jero_kernels_rvv::RepackedWeight` under `with-kernels` and a `128-byte`-aligned
 /// portable descriptor when built with `--no-default-features`.
 #[derive(Debug)]
 pub struct CachedDenseProjection {
