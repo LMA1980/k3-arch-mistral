@@ -367,11 +367,11 @@ fn test_wave2_256_warm_cache_multistep_decode_and_compact_half_parity() {
                 .decode_step_with_cache(&mut ctx_cached, &weights, &mut warm_cache)
                 .expect("cached decode");
         }
-        // Zero new decodes or repacks during prefill+decode after warm_layer_cache.
+        // Zero new decodes or repacks during batched prefill (14 projections) + 2 decode steps (28).
         assert_eq!(warm_cache.stats().norm_decodes, 5);
         assert_eq!(warm_cache.stats().dense_repacks, 14);
         assert!(warm_cache.stats().norm_hits >= 15);
-        assert!(warm_cache.stats().dense_hits >= 56);
+        assert_eq!(warm_cache.stats().dense_hits, 42);
 
         // Compare cached path against zero-budget DirectFallback execution.
         let mut fb_cache = MistralLayerCache::new().with_max_repacked_bytes(0);
@@ -569,7 +569,9 @@ fn test_wave2_mixtral_256_multistep_3d_exps_zero_copy_headroom_parity() {
                 "packed vs split MoE delta for {quant:?}"
             );
         }
-        assert!(cache_packed.stats().expert_zero_copy_slices >= 4 * 2 * 3);
+        // Batched prefill deduplicates active experts per batch (2..=4 unique experts) + 2 decode steps (4).
+        assert!(cache_packed.stats().expert_zero_copy_slices >= 6 * 3);
+        assert!(cache_packed.stats().expert_zero_copy_slices <= 24);
         // Only dense attention + router (5 matrices) were repacked, zero 3D experts.
         assert_eq!(cache_packed.cached_dense_count(), 5);
     }
