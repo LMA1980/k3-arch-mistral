@@ -322,7 +322,7 @@ dependencies = [
 [[package]]
 name = "jero-core"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-core.git?branch=main#04e5696e0d32e7cf46bbe183353b27bd5ea51ab6"
+source = "git+https://github.com/LMA1980/jero-core.git?branch=main#587c3f777913c3c4f1d3cec46c75b47aa8cfc38d"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -338,7 +338,7 @@ dependencies = [
 [[package]]
 name = "jero-kernels-rvv"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#902beb640665fe1e9fb985e4b1e26b2bc72b7e98"
+source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#93175f61b9dda8bf61ac5a0dadacaa366cc2e3a1"
 dependencies = [
  "jero-core",
 ]

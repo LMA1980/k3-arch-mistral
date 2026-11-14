@@ -1,16 +1,20 @@
 //! `jero-arch-mistral`: Mistral and Mixtral architecture recipe for the `SpacemiT` K3 platform.
 //!
-//! Implements [`ArchRecipe`] for Mistral and Mixtral models (`mistral`, `mixtral`),
+//! Implements [`jero_core::ArchRecipe`] for Mistral and Mixtral models (`mistral`, `mixtral`),
 //! supporting Sliding Window Attention (SWA), top-2 of 8 Sparse Mixture-of-Experts (`MoE`) routing,
 //! and 28 GiB `RLIMIT_MEMLOCK` admission policy enforcement per ADR-023, ADR-024, and ADR-037.
 
 pub mod admission;
+mod kernels_compat;
 pub mod recipe;
+
+#[cfg(test)]
+mod forward_tests;
 
 pub use admission::{
     COMPACT_MOE_ADVISORY, DEFAULT_MEMLOCK_LIMIT_BYTES, evaluate_moe_memlock_admission,
 };
-pub use recipe::{MistralRecipe, route_top2_experts};
+pub use recipe::{MistralRecipe, RopeScalingConfig, route_top2_experts, route_topk_experts};
 
 #[cfg(test)]
 mod tests {
